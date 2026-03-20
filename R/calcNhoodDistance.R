@@ -58,32 +58,30 @@ calcNhoodDistance <- function(x, d, reduced.dim=NULL, use.assay="logcounts"){
         stop("Input is not a valid Milo object")
     }
 
-    non.zero.nhoods <- which(nhoods(x)!=0, arr.ind = TRUE)
-
+    # Resolve which reduced dim matrix to use
     if(is.character(reduced.dim)){
-        # check if it exists in the slot
         if(!any(names(reducedDims(x)) %in% reduced.dim)){
             stop(reduced.dim, " not found in the reducedDim slot")
         }
-        nhood.dists <- sapply(seq_len(ncol(nhoods(x))),
-                              function(X) .calc_distance(reducedDim(x, reduced.dim)[non.zero.nhoods[non.zero.nhoods[,'col']==X,'row'],
-                                                                                    seq_len(d),drop=FALSE]))
-        names(nhood.dists) <- nhoodIndex(x)
+        red_dim_mat <- reducedDim(x, reduced.dim)[, seq_len(d), drop=FALSE]
     } else if(is(reduced.dim, "matrix")){
-        nhood.dists <- sapply(seq_len(ncol(nhoods(x))),
-                              function(X) .calc_distance(reduced.dim[non.zero.nhoods[non.zero.nhoods[,'col']==X,'row'],
-                                                                     seq_len(d),drop=FALSE]))
+        red_dim_mat <- reduced.dim[, seq_len(d), drop=FALSE]
     } else if(is.null(reduced.dim)){
         if(any(names(reducedDims(x)) %in% c("PCA"))){
-            nhood.dists <- sapply(seq_len(ncol(nhoods(x))),
-                                  function(X) .calc_distance(reducedDim(x, "PCA")[non.zero.nhoods[non.zero.nhoods[,'col']==X,'row'],
-                                                                                  seq_len(d),drop=FALSE]))
-            names(nhood.dists) <- nhoodIndex(x)
-
+            red_dim_mat <- reducedDim(x, "PCA")[, seq_len(d), drop=FALSE]
         } else{
             stop("No reduced.dim slot specified")
         }
     }
+
+    # Pre-split nhood membership by column for O(N_entries) lookup
+    non.zero.nhoods <- which(nhoods(x)!=0, arr.ind = TRUE)
+    nhood_members <- split(non.zero.nhoods[, "row"], non.zero.nhoods[, "col"])
+
+    nhood.dists <- lapply(nhood_members, function(rows) {
+        .calc_distance(red_dim_mat[rows, , drop=FALSE])
+    })
+    names(nhood.dists) <- nhoodIndex(x)
 
     nhoodDistances(x) <- nhood.dists
 
@@ -91,21 +89,14 @@ calcNhoodDistance <- function(x, d, reduced.dim=NULL, use.assay="logcounts"){
 }
 
 
-#' @importFrom Matrix rowSums sparseMatrix
+#' @importFrom Matrix Matrix
+#' @importFrom stats dist
 #' @importFrom methods as
 #' @export
 .calc_distance <- function(in.x){
-
-    dist.list <- lapply(seq_len(nrow(in.x)), FUN=function(i){
-        i.dist <- apply(in.x, 1, FUN=function(P) sqrt(sum((P - in.x[i, ])**2)))
-        list("rowIndex"=rep(i, nrow(in.x)), "colIndex"=seq_len(length(i.dist)),
-             "dist"=i.dist)
-        })
-
-    dist.df <- do.call(rbind.data.frame, dist.list)
-    out.dist <- sparseMatrix(i=dist.df$rowIndex, j=dist.df$colIndex, x=dist.df$dist,
-                             dimnames=list(rownames(in.x), rownames(in.x)),
-                             repr="T")
+    d <- as.matrix(dist(in.x))
+    out.dist <- Matrix(d, sparse = TRUE)
+    dimnames(out.dist) <- list(rownames(in.x), rownames(in.x))
     return(out.dist)
 }
 

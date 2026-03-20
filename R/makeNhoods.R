@@ -22,6 +22,11 @@
 #' specified by the refinement_scheme argument.
 #' @param refinement_scheme A character scalar that defines the sampling scheme, either "reduced_dim" or "graph".
 #' Default is "reduced_dim".
+#' @param BPPARAM A \code{BiocParallelParam} object for parallelizing KNN searches
+#' in refined sampling. Defaults to \code{SerialParam()}.
+#' @param BNPARAM A \code{BiocNeighborParam} object specifying the KNN algorithm.
+#' Defaults to \code{KmknnParam()} (exact). Use \code{HnswParam()} or
+#' \code{AnnoyParam()} for approximate methods on large datasets.
 #'
 #' @details
 #' This function randomly samples graph vertices, then refines them to collapse
@@ -50,10 +55,14 @@
 #'
 #' @export
 #' @rdname makeNhoods
-#' @importFrom BiocNeighbors findKNN
+#' @importFrom BiocNeighbors findKNN queryKNN
 #' @importFrom igraph neighbors neighborhood as_ids V
+#' @importFrom Matrix sparseMatrix
 #' @importFrom stats setNames
-makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA", refinement_scheme = "reduced_dim") {
+makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA",
+                       refinement_scheme = "reduced_dim",
+                       BPPARAM = BiocParallel::SerialParam(),
+                       BNPARAM = BiocNeighbors::KmknnParam()) {
     if(is(x, "Milo")){
         message("Checking valid object")
         # check that a graph has been built
@@ -107,7 +116,8 @@ makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA"
         sampled_vertices <- random_vertices
     } else if (isTRUE(refined)) {
         if(refinement_scheme == "reduced_dim"){
-            sampled_vertices <- .refined_sampling(random_vertices, X_reduced_dims, k)
+            sampled_vertices <- .refined_sampling(random_vertices, X_reduced_dims, k,
+                                                    BPPARAM = BPPARAM, BNPARAM = BNPARAM)
         } else if (refinement_scheme == "graph") {
             sampled_vertices <- .graph_refined_sampling(random_vertices, x.graph)
         } else {
@@ -119,31 +129,33 @@ makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA"
 
     sampled_vertices <- unique(sampled_vertices)
 
-    if(is(x, "Milo")){
-        nh_mat <- Matrix(data = 0, nrow=ncol(x), ncol=length(sampled_vertices), sparse = TRUE)
-    } else if(is(x, "igraph")){
-        nh_mat <- Matrix(data = 0, nrow=length(V(x)), ncol=length(sampled_vertices), sparse = TRUE)
-    }
-    # Is there an alternative to using a for loop to populate the sparseMatrix here?
-    # if vertex names are set (as can happen with graphs from 3rd party tools), then set rownames of nh_mat
+    # Determine row count and names for the nhood matrix
     v.class <- V(x.graph)$name
-
     if(is(x, "Milo")){
-        rownames(nh_mat) <- colnames(x)
+        n_rows <- ncol(x)
+        rnames <- colnames(x)
     } else if(is(x, "igraph")){
+        n_rows <- length(V(x))
         if(is.null(v.class) & refinement_scheme == "reduced_dim"){
-            rownames(nh_mat) <- rownames(X_reduced_dims)
+            rnames <- rownames(X_reduced_dims)
         } else if(!is.null(v.class)){
-            rownames(nh_mat) <- V(x.graph)$name
+            rnames <- V(x.graph)$name
+        } else {
+            rnames <- NULL
         }
     }
 
-    for (X in seq_len(length(sampled_vertices))){
-        nh_mat[unlist(neighborhood(x.graph, order = 1, nodes = sampled_vertices[X])), X] <- 1 #changed to include index cells
-    }
+    # Build nhood matrix from COO triplets (vectorized neighborhood call)
+    nhood_lists <- neighborhood(x.graph, order = 1, nodes = sampled_vertices)
+    col_indices <- rep(seq_len(length(sampled_vertices)), lengths(nhood_lists))
+    row_indices <- unlist(nhood_lists)
 
-    # need to add the index cells.
-    colnames(nh_mat) <- as.character(sampled_vertices)
+    nh_mat <- sparseMatrix(
+        i = row_indices, j = col_indices,
+        x = rep(1, length(row_indices)),
+        dims = c(n_rows, length(sampled_vertices)),
+        dimnames = list(rnames, as.character(sampled_vertices))
+    )
     if(is(x, "Milo")){
         nhoodIndex(x) <- as(sampled_vertices, "list")
         nhoods(x) <- nh_mat
@@ -154,9 +166,11 @@ makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA"
 }
 
 
-#' @importFrom BiocNeighbors findKNN
+#' @importFrom BiocNeighbors findKNN queryKNN
 #' @importFrom matrixStats colMedians
-.refined_sampling <- function(random_vertices, X_reduced_dims, k){
+.refined_sampling <- function(random_vertices, X_reduced_dims, k,
+                              BPPARAM = BiocParallel::SerialParam(),
+                              BNPARAM = BiocNeighbors::KmknnParam()){
     message("Running refined sampling with reduced_dim")
     vertex.knn <-
         findKNN(
@@ -164,41 +178,29 @@ makeNhoods <- function(x, prop=0.1, k=21, d=30, refined=TRUE, reduced_dims="PCA"
             k = k,
             subset = as.vector(random_vertices),
             get.index = TRUE,
-            get.distance = FALSE
+            get.distance = FALSE,
+            BPPARAM = BPPARAM,
+            BNPARAM = BNPARAM
         )
 
     nh_reduced_dims <- t(apply(vertex.knn$index, 1, function(x) colMedians(X_reduced_dims[x,])))
 
-    # this function fails if rownames are not set
     if(is.null(rownames(X_reduced_dims))){
         warning("Rownames not set on reducedDims - setting to row indices")
         rownames(X_reduced_dims) <- as.character(seq_len(nrow(X_reduced_dims)))
     }
 
     colnames(nh_reduced_dims) <- colnames(X_reduced_dims)
-    rownames(nh_reduced_dims) <- paste0('nh_', seq_len(nrow(nh_reduced_dims)))
 
-    ## Search nearest cell to average profile
-    # I have to do this trick because as far as I know there is no fast function to
-    # search for NN between 2 distinct sets of points (here I'd like to search NNs of
-    # nh_reduced_dims points among X_reduced_dims points). Suggestions are welcome
-    all_reduced_dims <- rbind(nh_reduced_dims, X_reduced_dims)
-
-    ## a change in BiocNeighbors creates a type error for subset=character vectors
-    nn_mat <- findKNN(all_reduced_dims,
-                      k = nrow(nh_reduced_dims) + 1,
-                      subset = which(rownames(nh_reduced_dims) %in% rownames(all_reduced_dims)))[["index"]]
-    ## Look for first NN that is not another nhood
-    nh_ixs <- seq_len(nrow(nh_reduced_dims))
-    i = 1
-    sampled_vertices <- rep(0, nrow(nn_mat))
-    while (any(sampled_vertices <= max(nh_ixs))) {
-        update_ix <- which(sampled_vertices <= max(nh_ixs))
-        sampled_vertices[update_ix] <- nn_mat[update_ix, i]
-        i <- i + 1
-    }
-    ## Reset indexes
-    sampled_vertices <- sampled_vertices - max(nh_ixs)
+    ## Search nearest cell to each median profile using queryKNN
+    nn_result <- queryKNN(
+        X = X_reduced_dims,
+        query = nh_reduced_dims,
+        k = 1,
+        BPPARAM = BPPARAM,
+        BNPARAM = BNPARAM
+    )
+    sampled_vertices <- as.integer(nn_result$index[, 1])
     return(sampled_vertices)
 }
 
